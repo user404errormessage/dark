@@ -1,0 +1,671 @@
+--// Ultimate Rivals Script | Obsidian UI
+--// Fixed: Proper toggles, New Fast Fire, Working Wallbang
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+if game.GameId ~= 6035872082 then
+    warn("This script is only for Rivals!")
+    return
+end
+
+--// Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local LogService = game:GetService("LogService")
+local ScriptContext = game:GetService("ScriptContext")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+--// Load Obsidian UI
+local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
+local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
+local SaveManager = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+
+local Options = Library.Options
+local Toggles = Library.Toggles
+
+--// Feature States
+local Features = {
+    AntiCheat = { Enabled = false, Init = false },
+    FastFire = { Enabled = false, Original = {} },
+    Wallbang = { Enabled = false, Active = false, Target = nil, Conn = nil, Task = nil, OldFunc = nil },
+    AutoLoadout = { Enabled = true, Conn = nil },
+    AutoShoot = { Enabled = false },
+    InfiniteJump = { Enabled = false, Conn = nil },
+    SilentAim = { Enabled = false, OldRaycast = nil }
+}
+
+--// Config
+local Config = {
+    WeaponChoices = { [1] = "Bow", [2] = "Handgun", [3] = "Fists", [4] = "Grenade" },
+    SilentAimPart = "Head",
+    SilentAimFOV = 200,
+}
+
+--// Utility
+local Utility = require(ReplicatedStorage.Modules.Utility)
+local GunModule = require(LocalPlayer.PlayerScripts.Modules.ItemTypes.Gun)
+local ItemLibrary = require(ReplicatedStorage.Modules.ItemLibrary).Items
+local MechanicsController = require(LocalPlayer.PlayerScripts.Controllers.MechanicsController)
+local DebugController = require(LocalPlayer.PlayerScripts.Controllers:WaitForChild("DebugController"))
+
+--// ============================================
+--// ANTI-CHEAT BYPASS
+--// ============================================
+local function ToggleAntiCheat(enabled)
+    if enabled and not Features.AntiCheat.Init then
+        Features.AntiCheat.Init = true
+        local success, err = pcall(function()
+            assert(getgc and debug and debug.info and hookfunction and getconnections and newcclosure, "Missing required functions")
+            
+            -- Hook Analytics
+            task.spawn(function()
+                for _, v in pairs(getgc(true)) do
+                    if typeof(v) == "function" then
+                        local ok, src = pcall(function() return debug.info(v, "s") end)
+                        if ok and type(src) == "string" and string.find(src, "AnalyticsPipelineController") then
+                            hookfunction(v, newcclosure(function() return wait(9e9) end))
+                        end
+                    end
+                end
+            end)
+            
+            -- Hook Remotes
+            task.spawn(function()
+                local ok, remote = pcall(function()
+                    return ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("AnalyticsPipeline"):WaitForChild("RemoteEvent")
+                end)
+                if ok and remote then
+                    for _, conn in pairs(getconnections(remote.OnClientEvent)) do
+                        if conn and conn.Function then
+                            pcall(function() hookfunction(conn.Function, newcclosure(function() end)) end)
+                        end
+                    end
+                end
+            end)
+            
+            -- Hook Logs
+            task.spawn(function()
+                for _, conn in pairs(getconnections(LogService.MessageOut)) do
+                    if conn and conn.Function then
+                        pcall(function() hookfunction(conn.Function, newcclosure(function() end)) end)
+                    end
+                end
+            end)
+            
+            -- Hook Errors
+            task.spawn(function()
+                for _, conn in ipairs(getconnections(ScriptContext.Error)) do
+                    pcall(function() conn:Disable() end)
+                end
+                pcall(function()
+                    hookfunction(ScriptContext.Error.Connect, newcclosure(function() return nil end))
+                end)
+            end)
+            
+            -- Hook Kick
+            task.spawn(function()
+                for _, name in ipairs({"Kick", "kick"}) do
+                    local fn = LocalPlayer[name]
+                    if type(fn) == "function" then
+                        local oldkick
+                        oldkick = hookfunction(fn, newcclosure(function(self, ...)
+                            if self == LocalPlayer then return end
+                            return oldkick(self, ...)
+                        end))
+                    end
+                end
+            end)
+        end)
+        
+        if success then
+            Library:Notify({ Title = "Anti-Cheat", Description = "Successfully disabled!", Time = 3 })
+        else
+            warn("Anti-Cheat failed: " .. tostring(err))
+        end
+    end
+    Features.AntiCheat.Enabled = enabled
+end
+
+--// ============================================
+--// FAST FIRE (NEW)
+--// ============================================
+local function ToggleFastFire(enabled)
+    if enabled then
+        local gunExceptions = { ["Sniper"] = true, ["Crossbow"] = true, ["Bow"] = true, ["RPG"] = true }
+        
+        for name, data in pairs(ItemLibrary) do
+            if typeof(data) == "table" and not gunExceptions[name] then
+                -- Save originals
+                if not Features.FastFire.Original[name] then
+                    Features.FastFire.Original[name] = {
+                        ShootSpread = data.ShootSpread,
+                        ShootAccuracy = data.ShootAccuracy,
+                        ShootRecoil = data.ShootRecoil,
+                        ShootCooldown = data.ShootCooldown,
+                        ShootBurstCooldown = data.ShootBurstCooldown,
+                        AttackCooldown = data.AttackCooldown,
+                        SwingCooldown = data.SwingCooldown,
+                        Cooldown = data.Cooldown,
+                        RecoveryTime = data.RecoveryTime,
+                        ResetTime = data.ResetTime
+                    }
+                end
+                
+                -- Apply fast fire
+                if data.ShootSpread then data.ShootSpread = 0 end
+                if data.ShootAccuracy then data.ShootAccuracy = 0 end
+                if data.ShootRecoil then data.ShootRecoil = 0 end
+                if data.ShootCooldown then data.ShootCooldown = 0.001 end
+                if data.ShootBurstCooldown then data.ShootBurstCooldown = 0.001 end
+                if data.AttackCooldown then data.AttackCooldown = 0.001 end
+                if data.SwingCooldown then data.SwingCooldown = 0.001 end
+                if data.Cooldown then data.Cooldown = 0.001 end
+                if data.RecoveryTime then data.RecoveryTime = 0.001 end
+                if data.ResetTime then data.ResetTime = 0.001 end
+            end
+        end
+        Library:Notify({ Title = "Fast Fire", Description = "Enabled!", Time = 2 })
+    else
+        -- Restore originals
+        for name, orig in pairs(Features.FastFire.Original) do
+            local data = ItemLibrary[name]
+            if data then
+                for key, val in pairs(orig) do
+                    data[key] = val
+                end
+            end
+        end
+        Library:Notify({ Title = "Fast Fire", Description = "Disabled!", Time = 2 })
+    end
+    Features.FastFire.Enabled = enabled
+end
+
+--// ============================================
+--// WALLBANG (WORKING)
+--// ============================================
+local function FindTarget()
+    local myChar = LocalPlayer.Character
+    if not myChar then return nil end
+    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return nil end
+    
+    local closest, closestDist = nil, 200
+    for _, player in next, Players:GetPlayers() do
+        if player == LocalPlayer then continue end
+        if player:GetAttribute("TeamID") == LocalPlayer:GetAttribute("TeamID") then continue end
+        
+        local char = player.Character
+        if not char then continue end
+        
+        local root = char:FindFirstChild("HumanoidRootPart")
+        local head = char:FindFirstChild("Head")
+        local hum = char:FindFirstChildWhichIsA("Humanoid")
+        
+        if not (root and head and hum and hum.Health > 0) then continue end
+        
+        local dist = (myRoot.Position - root.Position).Magnitude
+        if dist < closestDist then
+            closestDist = dist
+            closest = player
+        end
+    end
+    return closest
+end
+
+local function DesyncStart(target)
+    if Features.Wallbang.Conn then Features.Wallbang.Conn:Disconnect() end
+    Features.Wallbang.Active = true
+    Features.Wallbang.Target = target
+    
+    Features.Wallbang.Conn = RunService.Heartbeat:Connect(function()
+        if not Features.Wallbang.Active then return end
+        local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if not myRoot then return end
+        
+        local targetRoot = target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+        if not targetRoot then
+            -- DesyncStop()
+            return
+        end
+        
+        local oldCFrame = myRoot.CFrame
+        local oldVel = myRoot.Velocity
+        local oldRotVel = myRoot.RotVelocity
+        
+        myRoot.CFrame = targetRoot.CFrame * CFrame.new(0, -5, 0)
+        
+        RunService:BindToRenderStep("__restore", 101, function()
+            myRoot.CFrame = oldCFrame
+            myRoot.Velocity = oldVel
+            myRoot.RotVelocity = oldRotVel
+            RunService:UnbindFromRenderStep("__restore")
+        end)
+    end)
+end
+
+local function DesyncStop()
+    Features.Wallbang.Active = false
+    Features.Wallbang.Target = nil
+    if Features.Wallbang.Conn then
+        Features.Wallbang.Conn:Disconnect()
+        Features.Wallbang.Conn = nil
+    end
+    if Features.Wallbang.Task then
+        task.cancel(Features.Wallbang.Task)
+        Features.Wallbang.Task = nil
+    end
+end
+
+local function WallbangHook(self, ...)
+    local results = {Features.Wallbang.OldFunc(self, ...)}
+    
+    if not self.ClientFighter or not self.ClientFighter.IsLocalPlayer then
+        return unpack(results)
+    end
+    
+    local bulletData = results[3]
+    if not bulletData or typeof(bulletData) ~= "table" then
+        return unpack(results)
+    end
+    
+    results[4] = true
+    
+    if not Features.Wallbang.Enabled then
+        return unpack(results)
+    end
+    
+    local target = FindTarget()
+    if not target or not target.Character then
+        return unpack(results)
+    end
+    
+    -- Desync
+    if not Features.Wallbang.Active or Features.Wallbang.Target ~= target then
+        DesyncStart(target)
+        task.wait(0.1)
+    end
+    
+    if Features.Wallbang.Task then
+        task.cancel(Features.Wallbang.Task)
+        Features.Wallbang.Task = nil
+    end
+    
+    -- Bullet Redirection
+    local targetHead = target.Character:FindFirstChild("Head")
+    if targetHead then
+        local pos = targetHead.Position
+        local offsetPos = pos - Vector3.new(0, 5, 0)
+        local lookCFrame = CFrame.lookAt(offsetPos, pos)
+        local randomOffset = CFrame.new(pos + Vector3.new(math.random(), math.random(), math.random()))
+        
+        bulletData[utf8.char(0)] = Utility:EncodeCFrame(CFrame.new(offsetPos, pos) * CFrame.Angles(lookCFrame:ToOrientation()))
+        bulletData[utf8.char(1)] = Utility:EncodeCFrame(CFrame.new(pos) * CFrame.Angles(lookCFrame:ToOrientation()))
+        bulletData[utf8.char(2)] = targetHead
+        bulletData[utf8.char(3)] = Utility:EncodeCFrame(targetHead.CFrame:ToObjectSpace(randomOffset))
+    end
+    
+    Features.Wallbang.Task = task.delay(0.15, DesyncStop)
+    
+    return unpack(results)
+end
+
+local function ToggleWallbang(enabled)
+    if enabled then
+        if not Features.Wallbang.OldFunc then
+            Features.Wallbang.OldFunc = GunModule.StartShooting
+            GunModule.StartShooting = WallbangHook
+        end
+        Library:Notify({ Title = "Wallbang", Description = "Enabled!", Time = 2 })
+    else
+        if Features.Wallbang.OldFunc then
+            GunModule.StartShooting = Features.Wallbang.OldFunc
+            Features.Wallbang.OldFunc = nil
+        end
+        DesyncStop()
+        Library:Notify({ Title = "Wallbang", Description = "Disabled!", Time = 2 })
+    end
+    Features.Wallbang.Enabled = enabled
+end
+
+--// ============================================
+--// AUTO LOADOUT
+--// ============================================
+local weaponPickRemote = ReplicatedStorage.Remotes.Replication.Fighter.PickWeapons
+local prePickRemote = ReplicatedStorage.Remotes.Duels.PickWeaponsAheadOfTime
+
+local function ToggleAutoLoadout(enabled)
+    if enabled then
+        if Features.AutoLoadout.Conn then return end
+        Features.AutoLoadout.Conn = task.spawn(function()
+            while task.wait(0.1) do
+                if not Features.AutoLoadout.Enabled then continue end
+                
+                local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+                local selectionInterface = playerGui and playerGui:FindFirstChild("PickWeapons", true)
+                
+                if selectionInterface and selectionInterface.Visible then
+                    local payload = {}
+                    for index, weaponName in next, Config.WeaponChoices do
+                        if weaponName and weaponName ~= "" then
+                            payload[index] = weaponName
+                        end
+                    end
+                    
+                    if next(payload) then
+                        pcall(function()
+                            weaponPickRemote:FireServer(payload)
+                            prePickRemote:FireServer(payload)
+                        end)
+                    end
+                    
+                    repeat task.wait(0.1) until not (selectionInterface and selectionInterface.Visible)
+                end
+            end
+        end)
+    else
+        -- Just stop checking, the loop will skip
+    end
+    Features.AutoLoadout.Enabled = enabled
+end
+
+--// ============================================
+--// AUTO SHOOT EMULATOR
+--// ============================================
+local function ToggleAutoShoot(enabled)
+    DebugController:SetHandicapsEnabled(enabled)
+    Features.AutoShoot.Enabled = enabled
+    Library:Notify({ Title = "Auto Shoot", Description = enabled and "Enabled!" or "Disabled!", Time = 2 })
+end
+
+--// ============================================
+--// INFINITE DOUBLE JUMP
+--// ============================================
+local function ToggleInfiniteJump(enabled)
+    if enabled then
+        if Features.InfiniteJump.Conn then return end
+        Features.InfiniteJump.Conn = RunService.Heartbeat:Connect(function()
+            if Features.InfiniteJump.Enabled then
+                table.clear(MechanicsController._double_jumps_used)
+            end
+        end)
+    else
+        if Features.InfiniteJump.Conn then
+            Features.InfiniteJump.Conn:Disconnect()
+            Features.InfiniteJump.Conn = nil
+        end
+    end
+    Features.InfiniteJump.Enabled = enabled
+end
+
+--// ============================================
+--// SILENT AIM
+--// ============================================
+local function FetchEntities()
+    local entities = {}
+    for _, v in pairs(workspace:GetChildren()) do
+        if v:FindFirstChildOfClass("Humanoid") then
+            table.insert(entities, v)
+        elseif v.Name == "HurtEffect" then
+            for _, child in pairs(v:GetChildren()) do
+                if child.ClassName ~= "Highlight" then
+                    table.insert(entities, child)
+                end
+            end
+        end
+    end
+    return entities
+end
+
+local function GetNearest()
+    local target, dist = nil, math.huge
+    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    
+    for _, entity in pairs(FetchEntities()) do
+        if entity ~= LocalPlayer.Character and entity:FindFirstChild("HumanoidRootPart") then
+            local part = entity:FindFirstChild(Config.SilentAimPart)
+            if part then
+                local pos, visible = Camera:WorldToViewportPoint(part.Position)
+                if visible then
+                    local mag = (center - Vector2.new(pos.X, pos.Y)).Magnitude
+                    if mag < dist and mag < Config.SilentAimFOV then
+                        target, dist = entity, mag
+                    end
+                end
+            end
+        end
+    end
+    return target
+end
+
+local function SilentAimHook(...)
+    local args = {...}
+    local override = (args[4] == 999) and (function()
+        local aim = GetNearest()
+        local node = aim and aim:FindFirstChild(Config.SilentAimPart)
+        return node and node.Position
+    end)()
+    
+    if override then
+        args[3] = override
+    end
+    
+    return Features.SilentAim.OldRaycast(table.unpack(args))
+end
+
+local function ToggleSilentAim(enabled)
+    if enabled then
+        if not Features.SilentAim.OldRaycast then
+            Features.SilentAim.OldRaycast = Utility.Raycast
+            Utility.Raycast = SilentAimHook
+        end
+    else
+        if Features.SilentAim.OldRaycast then
+            Utility.Raycast = Features.SilentAim.OldRaycast
+            Features.SilentAim.OldRaycast = nil
+        end
+    end
+    Features.SilentAim.Enabled = enabled
+    Library:Notify({ Title = "Silent Aim", Description = enabled and "Enabled!" or "Disabled!", Time = 2 })
+end
+
+--// ============================================
+--// OBSIDIAN UI
+--// ============================================
+
+local Window = Library:CreateWindow({
+    Title = "Ultimate Rivals",
+    Footer = "by Venice",
+    ShowCustomCursor = true,
+    NotifySide = "Right",
+})
+
+local Tabs = {
+    Main = Window:AddTab("Main", "home"),
+    Rage = Window:AddTab("Rage", "zap"),
+    Settings = Window:AddTab("Settings", "settings"),
+    Credits = Window:AddTab("Credits", "user"),
+}
+
+--// MAIN TAB
+local MainLeft = Tabs.Main:AddLeftGroupbox("Essentials", "shield")
+local MainRight = Tabs.Main:AddRightGroupbox("Loadout", "backpack")
+
+MainLeft:AddToggle("AntiCheat", {
+    Text = "Anti-Cheat Bypass",
+    Default = false,
+    Tooltip = "Disables Rivals anticheat systems",
+    Callback = ToggleAntiCheat,
+})
+
+MainLeft:AddToggle("InfiniteJump", {
+    Text = "Infinite Double Jump",
+    Default = false,
+    Tooltip = "Unlimited double jumps",
+    Callback = ToggleInfiniteJump,
+})
+
+MainRight:AddToggle("AutoLoadout", {
+    Text = "Auto Loadout",
+    Default = true,
+    Tooltip = "Automatically selects weapons",
+    Callback = ToggleAutoLoadout,
+})
+
+local WeaponOptions = {"Bow", "Handgun", "Fists", "Grenade", "Rifle", "Shotgun", "SMG", "Sniper", "Rocket Launcher", "Flamethrower", "Minigun", "Crossbow"}
+
+for i = 1, 4 do
+    MainRight:AddDropdown("Weapon"..i, {
+        Values = WeaponOptions,
+        Default = Config.WeaponChoices[i] or "Fists",
+        Multi = false,
+        Text = "Weapon Slot " .. i,
+        Callback = function(Value)
+            Config.WeaponChoices[i] = Value
+        end,
+    })
+end
+
+--// RAGE TAB
+local RageLeft = Tabs.Rage:AddLeftGroupbox("Combat", "crosshair")
+local RageRight = Tabs.Rage:AddRightGroupbox("Aim", "target")
+
+RageLeft:AddToggle("SilentAim", {
+    Text = "Silent Aim",
+    Default = false,
+    Tooltip = "Redirects bullets to nearest target",
+    Risky = true,
+    Callback = ToggleSilentAim,
+})
+
+RageLeft:AddDropdown("AimPart", {
+    Values = {"Head", "HumanoidRootPart", "Torso"},
+    Default = Config.SilentAimPart,
+    Multi = false,
+    Text = "Target Part",
+    Callback = function(Value)
+        Config.SilentAimPart = Value
+    end,
+})
+
+RageLeft:AddSlider("AimFOV", {
+    Text = "Silent Aim FOV",
+    Default = Config.SilentAimFOV,
+    Min = 50,
+    Max = 500,
+    Rounding = 0,
+    Callback = function(Value)
+        Config.SilentAimFOV = Value
+    end,
+})
+
+RageRight:AddToggle("FastFire", {
+    Text = "Fast Fire",
+    Default = false,
+    Tooltip = "Removes shoot cooldown (Guns & Melee)",
+    Risky = true,
+    Callback = ToggleFastFire,
+})
+
+RageRight:AddToggle("Wallbang", {
+    Text = "Wallbang",
+    Default = false,
+    Tooltip = "Wallbang + Desync + Bullet Redirection",
+    Risky = true,
+    Callback = ToggleWallbang,
+})
+
+RageRight:AddToggle("AutoShoot", {
+    Text = "Auto Shoot Emulator",
+    Default = false,
+    Tooltip = "PC auto shoot (Debug Handicaps)",
+    Callback = ToggleAutoShoot,
+})
+
+--// SETTINGS TAB
+local SettingsLeft = Tabs.Settings:AddLeftGroupbox("Menu", "settings")
+local SettingsRight = Tabs.Settings:AddRightGroupbox("Config", "save")
+
+SettingsLeft:AddToggle("KeybindMenu", {
+    Text = "Open Keybind Menu",
+    Default = Library.KeybindFrame.Visible,
+    Callback = function(value)
+        Library.KeybindFrame.Visible = value
+    end,
+})
+
+SettingsLeft:AddToggle("CustomCursor", {
+    Text = "Custom Cursor",
+    Default = true,
+    Callback = function(Value)
+        Library.ShowCustomCursor = Value
+    end,
+})
+
+SettingsLeft:AddLabel("Menu Keybind"):AddKeyPicker("MenuKeybind", {
+    Default = "RightShift",
+    NoUI = true,
+    Text = "Menu keybind",
+})
+
+Library.ToggleKeybind = Options.MenuKeybind
+
+SettingsRight:AddButton({
+    Text = "Destroy UI",
+    Func = function()
+        -- Cleanup all features
+        ToggleAntiCheat(false)
+        ToggleFastFire(false)
+        ToggleWallbang(false)
+        ToggleAutoLoadout(false)
+        ToggleAutoShoot(false)
+        ToggleInfiniteJump(false)
+        ToggleSilentAim(false)
+        Library:Unload()
+    end,
+    DoubleClick = true,
+    Tooltip = "Double click to destroy",
+})
+
+--// CREDITS TAB
+Tabs.Credits:AddLeftGroupbox("Info", "info"):AddLabel("Ultimate Rivals v2.0", true)
+Tabs.Credits:AddLeftGroupbox("Features", "list"):AddLabel([[
+• Anti-Cheat Bypass
+• Fast Fire (Guns + Melee)
+• Wallbang + Desync
+• Auto Loadout
+• Auto Shoot Emulator
+• Infinite Double Jump
+• Silent Aim
+]], true)
+
+Tabs.Credits:AddRightGroupbox("Credits", "user"):AddLabel([[
+Script: Venice
+Fast Fire: flapparoblox & wrathscripts
+UI: Obsidian (deividcomsono)
+]], true)
+
+--// THEME & SAVE MANAGERS
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+ThemeManager:SetFolder("UltimateRivals")
+SaveManager:SetFolder("UltimateRivals/configs")
+SaveManager:BuildConfigSection(Tabs.Settings)
+ThemeManager:ApplyToTab(Tabs.Settings)
+
+--// INITIAL NOTIFICATION
+Library:Notify({
+    Title = "Dark Rivals",
+    Description = "Script loaded! All features working",
+    Time = 5,
+})
+
+print("Ultimate Rivals v2.0 Loaded | All features working with toggles")
